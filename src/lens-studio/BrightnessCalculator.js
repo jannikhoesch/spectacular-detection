@@ -18,6 +18,8 @@
  * @input bool sendToBackend = true
  * @input string backendUrl = "http://localhost:5000/api/brightness"
  * @input int sendInterval = 10 {"widget":"slider", "min":1, "max":60, "step":1}
+ * @input float brightnessThreshold = 0.5 {"widget":"slider", "min":0.0, "max":1.0, "step":0.05}
+ * @input float triggerDuration = 5.0 {"widget":"slider", "min":1.0, "max":30.0, "step":0.5}
  * @input bool enableLogging = false
  */
 
@@ -25,6 +27,12 @@
 const WCAG_R = 0.2126;
 const WCAG_G = 0.7152;
 const WCAG_B = 0.0722;
+
+// Global alert boolean - shared across all scripts
+// Access from other scripts: global.alert
+if (typeof global.alert === 'undefined') {
+    global.alert = false;
+}
 
 // Global state
 var state = {
@@ -37,8 +45,13 @@ var state = {
     textureWidth: 0,
     textureHeight: 0,
     cachedSamples: [],  // Pre-calculated sample positions
-    proceduralTexture: null,  // ProceduralTextureProvider for reading pixels
-    initialized: false
+    // Note: ProceduralTextureProvider is now created fresh each frame
+    // Brightness trigger state
+    isOverThreshold: false,
+    overThresholdDuration: 0.0,
+    lastUpdateTime: 0.0,
+    triggerActive: false,
+    hasTriggered: false  // Track if trigger has fired for this session
 };
 
 // Initialize ProceduralTextureProvider
@@ -56,21 +69,44 @@ function initialize() {
     
     if (cameraTexture) {
         try {
-            // Create ProceduralTextureProvider from texture
-            state.proceduralTexture = ProceduralTextureProvider.createFromTexture(cameraTexture);
+            // Get texture dimensions for sample position generation
             state.textureWidth = cameraTexture.getWidth();
             state.textureHeight = cameraTexture.getHeight();
             state.cachedSamples = generateSamplePositions(state.textureWidth, state.textureHeight, script.maxSamples);
-            state.initialized = true;
             print("BrightnessCalculator initialized successfully. Texture size: " + state.textureWidth + "x" + state.textureHeight);
+            print("Note: ProceduralTextureProvider will be created fresh each frame for accurate readings");
         } catch (e) {
-            print("ERROR: BrightnessCalculator - Failed to create ProceduralTextureProvider: " + e.toString());
+            print("ERROR: BrightnessCalculator - Failed to initialize: " + e.toString());
         }
     }
 }
 
 // Initialize on script load
 initialize();
+
+// Initialize time tracking
+state.lastUpdateTime = getTime();
+
+/**
+ * Trigger function called when brightness is over threshold for triggerDuration
+ * Override this or connect to your trigger mechanism
+ */
+function onBrightnessTrigger() {
+    // This is called when brightness threshold is exceeded for triggerDuration
+    print("[BrightnessCalculator] TRIGGER: Brightness has been over " + 
+          script.brightnessThreshold.toFixed(2) + " for " + 
+          state.overThresholdDuration.toFixed(1) + " seconds");
+
+    // Set global alert flag
+    global.alert = true;
+    
+    // You can add custom trigger logic here:
+    // - Dim lights
+    // - Show warning
+    // - Play sound
+    // - Trigger other scripts
+    // etc.
+}
 
 /**
  * Calculate brightness from RGB values using WCAG Relative Luminance formula
@@ -172,12 +208,36 @@ function generateSamplePositions(width, height, maxSamples) {
  * @returns {number} Average brightness (0.0 to 1.0)
  */
 function calculateFrameBrightness() {
-    if (!state.proceduralTexture || !state.initialized) {
-        // Try to reinitialize
-        if (state.frameCount % 60 === 0) {
-            initialize();
+    // Get fresh camera texture each frame to ensure we're reading current frame
+    var cameraTexture = script.deviceCameraTexture;
+    if (!cameraTexture) {
+        return state.smoothedValue > 0 ? state.smoothedValue : 0.0;
+    }
+    
+    // Recreate ProceduralTextureProvider each frame to get fresh pixel data
+    // This ensures we're reading the current frame, not a cached one
+    var proceduralTexture;
+    try {
+        proceduralTexture = ProceduralTextureProvider.createFromTexture(cameraTexture);
+    } catch (e) {
+        if (script.enableLogging && state.frameCount % 60 === 0) {
+            print("[BrightnessCalculator] Error creating ProceduralTextureProvider: " + e.toString());
         }
         return state.smoothedValue > 0 ? state.smoothedValue : 0.0;
+    }
+    
+    if (!proceduralTexture || !proceduralTexture.control) {
+        return state.smoothedValue > 0 ? state.smoothedValue : 0.0;
+    }
+    
+    // Update texture dimensions if they changed
+    var textureWidth = cameraTexture.getWidth();
+    var textureHeight = cameraTexture.getHeight();
+    
+    if (textureWidth !== state.textureWidth || textureHeight !== state.textureHeight || state.cachedSamples.length === 0) {
+        state.textureWidth = textureWidth;
+        state.textureHeight = textureHeight;
+        state.cachedSamples = generateSamplePositions(textureWidth, textureHeight, script.maxSamples);
     }
     
     var totalBrightness = 0.0;
@@ -190,16 +250,16 @@ function calculateFrameBrightness() {
         
         try {
             // Convert normalized coordinates to pixel coordinates
-            var pixelX = Math.floor(samplePos.x * state.textureWidth);
-            var pixelY = Math.floor(samplePos.y * state.textureHeight);
+            var pixelX = Math.floor(samplePos.x * textureWidth);
+            var pixelY = Math.floor(samplePos.y * textureHeight);
             
             // Ensure coordinates are within bounds
-            pixelX = Math.max(0, Math.min(state.textureWidth - 1, pixelX));
-            pixelY = Math.max(0, Math.min(state.textureHeight - 1, pixelY));
+            pixelX = Math.max(0, Math.min(textureWidth - 1, pixelX));
+            pixelY = Math.max(0, Math.min(textureHeight - 1, pixelY));
             
             // Read pixel using ProceduralTextureProvider.getPixels()
             // getPixels(x, y, width, height, dataArray)
-            state.proceduralTexture.control.getPixels(pixelX, pixelY, 1, 1, pixelData);
+            proceduralTexture.control.getPixels(pixelX, pixelY, 1, 1, pixelData);
             
             // Pixel data is in 0-255 range, normalize to 0-1
             var r = pixelData[0] / 255.0;
@@ -281,7 +341,8 @@ var lastDisplayedValue = -1.0;
  * Update function called every frame (performance optimized)
  */
 function onUpdate() {
-    if (!state.initialized) {
+    // Check if camera texture is available
+    if (!script.deviceCameraTexture) {
         // Try to initialize if not already done
         if (state.frameCount % 60 === 0) {
             initialize();
@@ -291,6 +352,9 @@ function onUpdate() {
     }
     
     state.frameCount++;
+    var currentTime = getTime();
+    var deltaTime = currentTime - state.lastUpdateTime;
+    state.lastUpdateTime = currentTime;
     
     // Only calculate brightness every N frames (configurable)
     var shouldCalculate = (state.frameCount - state.lastCalculatedFrame) >= script.calculationInterval;
@@ -309,6 +373,30 @@ function onUpdate() {
         
         state.value = newBrightness;
         state.lastCalculatedFrame = state.frameCount;
+    }
+    
+    // Check if brightness is over threshold
+    var wasOverThreshold = state.isOverThreshold;
+    state.isOverThreshold = state.smoothedValue > script.brightnessThreshold;
+    
+    // Update duration
+    if (state.isOverThreshold) {
+        state.overThresholdDuration += deltaTime;
+    } else {
+        // Reset duration and trigger state when below threshold
+        state.overThresholdDuration = 0.0;
+        state.triggerActive = false;
+        state.hasTriggered = false;
+    }
+    
+    // Check if trigger should be active (over threshold for too long)
+    var wasTriggerActive = state.triggerActive;
+    state.triggerActive = state.overThresholdDuration > script.triggerDuration;
+    
+    // Trigger once when threshold is exceeded
+    if (state.triggerActive && !wasTriggerActive && !state.hasTriggered) {
+        onBrightnessTrigger();
+        state.hasTriggered = true;
     }
     
     // Update text display if text component is assigned (only when value changes significantly)
@@ -335,7 +423,11 @@ function onUpdate() {
     
     // Optional: Log brightness for debugging
     if (script.enableLogging && state.frameCount % 30 === 0) {
-        print("[BrightnessCalculator] Frame " + state.frameCount + ": Brightness = " + state.smoothedValue.toFixed(4) + " (raw: " + state.value.toFixed(4) + ")");
+        if (script.showPercentage) {
+            print("[BrightnessCalculator] Frame " + state.frameCount + ": Brightness = " + state.smoothedValue.toFixed(2) + "%" + " (raw: " + state.value.toFixed(4) + ")");            
+        } else {
+            print("[BrightnessCalculator] Frame " + state.frameCount + ": Brightness = " + state.smoothedValue.toFixed(4) + " (raw: " + state.value.toFixed(4) + ")");            
+        }
     }
 }
 
@@ -370,3 +462,19 @@ script.api.getBrightnessCategory = function() {
         return "bright";
     }
 };
+
+// Export trigger-related API
+script.api.isOverThreshold = function() {
+    return state.isOverThreshold;
+};
+
+script.api.isTriggerActive = function() {
+    return state.triggerActive;
+};
+
+script.api.getOverThresholdDuration = function() {
+    return state.overThresholdDuration;
+};
+
+// Allow external scripts to override trigger function
+script.api.onBrightnessTrigger = onBrightnessTrigger;

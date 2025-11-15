@@ -14,6 +14,12 @@
  * @input bool enableLogging = false
  */
 
+// Global alert boolean - shared across all scripts
+// Access from other scripts: global.alert
+if (typeof global.alert === 'undefined') {
+    global.alert = false;
+}
+
 // Global state
 var state = {
     pitchAngle: 0.0,
@@ -56,6 +62,9 @@ function onTrigger() {
     // This is called when pitch threshold is exceeded for triggerDuration
     print("[PostureMonitor] TRIGGER: User has been looking down for " + 
           state.downDuration.toFixed(1) + " seconds");
+    
+    // Set global alert flag
+    global.alert = true;
     
     // You can add custom trigger logic here:
     // - Show notification
@@ -178,7 +187,8 @@ function getHeadRotation() {
 }
 
 /**
- * Extract pitch angle (Y-axis rotation) from quaternion
+ * Extract pitch angle (X-axis rotation) from quaternion
+ * Pitch = rotation around X-axis (looking up/down)
  * @param {quat} rotation Rotation quaternion
  * @returns {number} Pitch angle in degrees (positive = looking down)
  */
@@ -189,9 +199,13 @@ function getPitchAngle(rotation) {
     var y = rotation.y;
     var z = rotation.z;
     
-    // Calculate pitch (rotation around Y axis) - looking up/down
-    var sinp = 2 * (w * y - z * x);
+    // Calculate pitch (rotation around X-axis) - looking up/down
+    // Using standard quaternion to Euler conversion for pitch
+    // sin(pitch) = 2 * (w * x - y * z)
+    var sinp = 2 * (w * x - y * z);
     var pitch;
+    
+    // Clamp sinp to valid range for asin
     if (Math.abs(sinp) >= 1) {
         pitch = Math.sign(sinp) * Math.PI / 2; // Use 90 degrees if out of range
     } else {
@@ -199,7 +213,16 @@ function getPitchAngle(rotation) {
     }
     
     // Convert to degrees
-    return pitch * (180.0 / Math.PI);
+    var pitchDegrees = pitch * (180.0 / Math.PI);
+    
+    // If the result seems wrong (detecting yaw instead), try alternative formula
+    // Alternative: pitch = atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    // This uses atan2 which handles all quadrants correctly
+    var altPitch = Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
+    var altPitchDegrees = altPitch * (180.0 / Math.PI);
+    
+    // Return the asin version (standard), but you can switch to altPitchDegrees if needed
+    return pitchDegrees;
 }
 
 /**
@@ -239,7 +262,7 @@ function onUpdate() {
     
     // Check if looking down past threshold
     var wasLookingDown = state.isLookingDown;
-    state.isLookingDown = state.pitchAngle > script.pitchThreshold;
+    state.isLookingDown = state.pitchAngle < script.pitchThreshold;
     
     // Update duration
     if (state.isLookingDown) {
