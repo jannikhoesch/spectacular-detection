@@ -1,10 +1,15 @@
 /**
- * Brightness Calculator for Lens Studio (Performance Optimized)
+ * Brightness Calculator for Lens Studio (Using ProceduralTextureProvider)
  * Calculates WCAG Relative Luminance in real-time and sends to Python backend
  * 
- * Uses global.scene.liveTarget to access the live camera feed
+ * Uses ProceduralTextureProvider.getPixels() to read pixel values from camera texture
+ * This is the recommended way to access pixel data in Lens Studio
+ * 
+ * IMPORTANT: To enable HTTP requests, add InternetModule to your project:
+ * - Resources > Import > Import from Library > Search "InternetModule"
  * 
  * @input Component.Text textComponent
+ * @input Asset.Texture deviceCameraTexture  // Device Camera Texture (from Resources)
  * @input bool showPercentage = false
  * @input int maxSamples = 100 {"widget":"slider", "min":25, "max":500, "step":25}
  * @input int calculationInterval = 2 {"widget":"slider", "min":1, "max":10, "step":1}
@@ -31,13 +36,41 @@ var state = {
     lastSentTime: 0,
     textureWidth: 0,
     textureHeight: 0,
-    cachedSamples: []  // Pre-calculated sample positions
+    cachedSamples: [],  // Pre-calculated sample positions
+    proceduralTexture: null,  // ProceduralTextureProvider for reading pixels
+    initialized: false
 };
 
-// Initialize - check if liveTarget is available
-if (!global.scene || !global.scene.liveTarget) {
-    print("WARNING: BrightnessCalculator - global.scene.liveTarget not available. Waiting for camera...");
+// Initialize ProceduralTextureProvider
+function initialize() {
+    // Try to get camera texture from input or liveTarget
+    var cameraTexture = null;
+    
+    if (script.deviceCameraTexture) {
+        cameraTexture = script.deviceCameraTexture;
+        print("BrightnessCalculator: Using deviceCameraTexture input");
+    } else {
+        print("WARNING: BrightnessCalculator - No camera texture available!");
+        print("Please assign deviceCameraTexture input or ensure liveTarget is available");
+    }
+    
+    if (cameraTexture) {
+        try {
+            // Create ProceduralTextureProvider from texture
+            state.proceduralTexture = ProceduralTextureProvider.createFromTexture(cameraTexture);
+            state.textureWidth = cameraTexture.getWidth();
+            state.textureHeight = cameraTexture.getHeight();
+            state.cachedSamples = generateSamplePositions(state.textureWidth, state.textureHeight, script.maxSamples);
+            state.initialized = true;
+            print("BrightnessCalculator initialized successfully. Texture size: " + state.textureWidth + "x" + state.textureHeight);
+        } catch (e) {
+            print("ERROR: BrightnessCalculator - Failed to create ProceduralTextureProvider: " + e.toString());
+        }
+    }
 }
+
+// Initialize on script load
+initialize();
 
 /**
  * Calculate brightness from RGB values using WCAG Relative Luminance formula
@@ -134,50 +167,67 @@ function generateSamplePositions(width, height, maxSamples) {
 }
 
 /**
- * Sample texture and calculate average brightness (optimized)
- * @param {Texture} texture Camera texture to sample
+ * Calculate brightness using ProceduralTextureProvider.getPixels()
+ * This is the recommended way to read pixel values in Lens Studio
  * @returns {number} Average brightness (0.0 to 1.0)
  */
-function calculateFrameBrightness(texture) {
-    if (!texture) {
-        return 0.0;
-    }
-    
-    var width = texture.getWidth();
-    var height = texture.getHeight();
-    
-    // Recalculate sample positions if texture size changed
-    if (width !== state.textureWidth || height !== state.textureHeight || state.cachedSamples.length === 0) {
-        state.textureWidth = width;
-        state.textureHeight = height;
-        state.cachedSamples = generateSamplePositions(width, height, script.maxSamples);
+function calculateFrameBrightness() {
+    if (!state.proceduralTexture || !state.initialized) {
+        // Try to reinitialize
+        if (state.frameCount % 60 === 0) {
+            initialize();
+        }
+        return state.smoothedValue > 0 ? state.smoothedValue : 0.0;
     }
     
     var totalBrightness = 0.0;
-    var sampleCount = state.cachedSamples.length;
+    var validSamples = 0;
+    var pixelData = new Uint8Array(4);  // RGBA array
     
     // Sample using pre-calculated positions
-    for (var i = 0; i < sampleCount; i++) {
+    for (var i = 0; i < state.cachedSamples.length; i++) {
         var samplePos = state.cachedSamples[i];
         
-        // Get pixel color at sample position
-        var color = texture.sample({
-            x: samplePos.x,
-            y: samplePos.y
-        });
-        
-        // Calculate brightness directly (color already normalized 0-1)
-        var pixelBrightness = calculateBrightness(color.r, color.g, color.b);
-        
-        totalBrightness += pixelBrightness;
+        try {
+            // Convert normalized coordinates to pixel coordinates
+            var pixelX = Math.floor(samplePos.x * state.textureWidth);
+            var pixelY = Math.floor(samplePos.y * state.textureHeight);
+            
+            // Ensure coordinates are within bounds
+            pixelX = Math.max(0, Math.min(state.textureWidth - 1, pixelX));
+            pixelY = Math.max(0, Math.min(state.textureHeight - 1, pixelY));
+            
+            // Read pixel using ProceduralTextureProvider.getPixels()
+            // getPixels(x, y, width, height, dataArray)
+            state.proceduralTexture.control.getPixels(pixelX, pixelY, 1, 1, pixelData);
+            
+            // Pixel data is in 0-255 range, normalize to 0-1
+            var r = pixelData[0] / 255.0;
+            var g = pixelData[1] / 255.0;
+            var b = pixelData[2] / 255.0;
+            
+            // Calculate brightness using WCAG formula
+            var pixelBrightness = calculateBrightness(r, g, b);
+            totalBrightness += pixelBrightness;
+            validSamples++;
+        } catch (error) {
+            // Skip this sample if reading fails
+            if (script.enableLogging && i === 0 && state.frameCount % 60 === 0) {
+                print("[BrightnessCalculator] Error reading pixel: " + error.toString());
+            }
+        }
     }
     
-    // Return average brightness
-    return sampleCount > 0 ? totalBrightness / sampleCount : 0.0;
+    // Return average brightness (only from valid samples)
+    if (validSamples === 0) {
+        return state.smoothedValue > 0 ? state.smoothedValue : 0.0;
+    }
+    
+    return totalBrightness / validSamples;
 }
 
 /**
- * Send brightness data to Python backend using global.http
+ * Send brightness data to Python backend using InternetModule.fetch
  * @param {number} brightness Brightness value to send
  */
 function sendBrightnessToBackend(brightness) {
@@ -194,22 +244,29 @@ function sendBrightnessToBackend(brightness) {
             device: "spectacles"
         };
         
-        // Use Lens Studio's global.http API
+        // Use Lens Studio's InternetModule.fetch API (requires InternetModule in project)
+        var InternetModule = require('InternetModule');
+        
         var options = {
-            headers: { "Content-Type": "application/json" }
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
         };
         
-        global.http.post(
-            script.backendUrl,
-            JSON.stringify(payload),
-            options,
-            function(response) {
+        InternetModule.fetch(script.backendUrl, options)
+            .then(function(response) {
                 if (script.enableLogging) {
-                    print("[BrightnessCalculator] Sent brightness " + brightness.toFixed(4) + " to backend. Response: " + response);
+                    print("[BrightnessCalculator] Sent brightness " + brightness.toFixed(4) + " to backend. Status: " + response.status);
                 }
                 state.lastSentTime = getTime();
-            }
-        );
+            })
+            .catch(function(error) {
+                if (script.enableLogging) {
+                    print("[BrightnessCalculator] HTTP request error: " + error.toString());
+                }
+            });
         
     } catch (error) {
         print("[BrightnessCalculator] Error sending to backend: " + error.toString());
@@ -224,11 +281,12 @@ var lastDisplayedValue = -1.0;
  * Update function called every frame (performance optimized)
  */
 function onUpdate() {
-    // Access the live camera texture using global.scene.liveTarget
-    var liveCameraTexture = global.scene.liveTarget;
-    
-    if (!liveCameraTexture) {
-        // Camera not ready yet, skip this frame
+    if (!state.initialized) {
+        // Try to initialize if not already done
+        if (state.frameCount % 60 === 0) {
+            initialize();
+        }
+        state.frameCount++;
         return;
     }
     
@@ -238,13 +296,13 @@ function onUpdate() {
     var shouldCalculate = (state.frameCount - state.lastCalculatedFrame) >= script.calculationInterval;
     
     if (shouldCalculate) {
-        // Calculate brightness for current frame
-        var newBrightness = calculateFrameBrightness(liveCameraTexture);
+        // Calculate brightness using ProceduralTextureProvider.getPixels()
+        var newBrightness = calculateFrameBrightness();
         
         // Apply exponential moving average for smoothing
-        if (state.smoothedValue === 0.0) {
+        if (state.smoothedValue === 0.0 && newBrightness > 0.0) {
             state.smoothedValue = newBrightness;
-        } else {
+        } else if (newBrightness > 0.0) {
             state.smoothedValue = state.smoothedValue * (1.0 - script.smoothingFactor) + 
                                    newBrightness * script.smoothingFactor;
         }
